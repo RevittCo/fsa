@@ -1,4 +1,4 @@
-module github.com/revittconsulting/fsa/v2
+module github.com/revittco/fsa/v2
 
 go 1.22
 
