@@ -1,11 +1,13 @@
 package fsa
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
-	"github.com/go-chi/chi/v5"
+
 	"github.com/didip/tollbooth/v7"
 	"github.com/didip/tollbooth_chi"
+	"github.com/go-chi/chi/v5"
 )
 
 type Handler struct {
@@ -32,7 +34,8 @@ func (h *Handler) SetupRoutes(router chi.Router) {
 		}
 		r.Get("/auth/login", h.Login)
 		r.Get("/auth/confirm", h.ConfirmCode)
-		r.Get("/auth/refresh", h.RefreshToken)
+		r.Post("/auth/refresh", h.RefreshToken)
+		r.Post("/auth/logout", h.Logout)
 	})
 }
 
@@ -84,7 +87,7 @@ func (h *Handler) ConfirmCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	confirmed, jwt, err := h.auth.LoginStep2ConfirmCode(ctx, email, code)
+	confirmed, tokens, err := h.auth.LoginStep2ConfirmCode(ctx, email, code)
 	if err != nil {
 		WriteErr(w, err, http.StatusInternalServerError)
 		return
@@ -95,24 +98,37 @@ func (h *Handler) ConfirmCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	WriteJSON(w, jwt)
+	h.auth.SetTokenCookies(w, tokens)
+	h.auth.SetCSRFCookie(w)
+	WriteJSON(w, map[string]string{"status": "authenticated"})
 }
 
 func (h *Handler) RefreshToken(w http.ResponseWriter, r *http.Request) {
-	token := r.URL.Query().Get("token")
+	var req struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		WriteErr(w, fmt.Errorf("invalid request body"), http.StatusBadRequest)
+		return
+	}
 
-	ctx := r.Context()
-
-	if len(token) == 0 {
+	if len(req.Token) == 0 {
 		WriteErr(w, fmt.Errorf("token required"), http.StatusBadRequest)
 		return
 	}
 
-	jwt, err := h.auth.RefreshToken(ctx, token)
+	ctx := r.Context()
+	tokens, err := h.auth.RefreshToken(ctx, req.Token)
 	if err != nil {
 		WriteErr(w, err, http.StatusInternalServerError)
 		return
 	}
 
-	WriteJSON(w, jwt)
+	h.auth.SetTokenCookies(w, tokens)
+	WriteJSON(w, map[string]string{"status": "refreshed"})
+}
+
+func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
+	h.auth.ClearTokenCookies(w)
+	WriteJSON(w, map[string]string{"status": "logged_out"})
 }
