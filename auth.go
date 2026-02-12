@@ -1,19 +1,20 @@
 package fsa
 
 import (
+	"bytes"
+	"context"
 	"fmt"
+	"html/template"
 	"math/rand"
+	"net/http"
+	"net/url"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"time"
 
-	"bytes"
-	"context"
-	"github.com/google/uuid"
-	"html/template"
-	"path/filepath"
-	"runtime"
-
 	"github.com/golang-jwt/jwt/v4"
+	"github.com/google/uuid"
 )
 
 type IAuthDb interface {
@@ -44,6 +45,18 @@ const ClaimsKey Key = "claims"
 const UserEmailKey Key = "userEmail"
 const UserIdKey Key = "userId"
 
+type CookieConfig struct {
+	Domain   string        // For cross-subdomain auth
+	Secure   bool          // HTTPS only (default: true)
+	SameSite http.SameSite // Default: SameSiteStrictMode
+}
+
+type CSRFConfig struct {
+	CookieName  string // Default: "csrf_token"
+	HeaderName  string // Default: "X-CSRF-Token"
+	TokenLength int    // Default: 32
+}
+
 type Config struct {
 	AppName   string
 	Logo      string
@@ -62,6 +75,9 @@ type Config struct {
 	ReturnUrls []string
 
 	UseIdentity bool
+
+	CookieConfig *CookieConfig // Optional, uses secure defaults if nil
+	CSRFConfig   *CSRFConfig   // Optional, uses defaults if nil
 }
 
 type Token struct {
@@ -116,6 +132,25 @@ func NewWithMemDbAndDefaultTemplate(sender ICodeSender, uc IUserCreator, cfg *Co
 }
 
 func (a *Auth) LoginStep1SendVerificationCode(ctx context.Context, email, returnUrl string) error {
+	// Validate returnUrl
+	if returnUrl == "" {
+		if len(a.Cfg.ReturnUrls) > 0 {
+			returnUrl = a.Cfg.ReturnUrls[0]
+		} else {
+			return fmt.Errorf("returnUrl required and no defaults configured")
+		}
+	}
+
+	validReturnUrl := false
+	for _, u := range a.Cfg.ReturnUrls {
+		if u == returnUrl {
+			validReturnUrl = true
+			break
+		}
+	}
+	if !validReturnUrl {
+		return fmt.Errorf("invalid return url: %s", returnUrl)
+	}
 
 	validEmail := a.Ev.Validate(email)
 	if !validEmail {
@@ -137,8 +172,8 @@ func (a *Auth) LoginStep1SendVerificationCode(ctx context.Context, email, return
 		return err
 	}
 
-	// send the code
-	link := fmt.Sprintf("%s?code=%s&email=%s", returnUrl, code, email)
+	// send the code with URL-encoded parameters
+	link := fmt.Sprintf("%s?code=%s&email=%s", returnUrl, url.QueryEscape(code), url.QueryEscape(email))
 	body := a.ParseTemplate(link, code)
 	err = a.Sender.Send(email, "Login Verification Code", body)
 	if err != nil {

@@ -1,6 +1,6 @@
 module github.com/revittco/fsa/v2
 
-go 1.22
+go 1.26
 
 require (
 	github.com/didip/tollbooth/v7 v7.0.2

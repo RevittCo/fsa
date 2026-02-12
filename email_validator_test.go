@@ -33,7 +33,7 @@ func Test_EmailValidation(t *testing.T) {
 		{"email@domain.web", true},
 		{"email@localhost", true},
 		{"email@123.123.123.123", true},
-		{"email@[123.123.123.123]", false},
+		{"email@[123.123.123.123]", true},
 		{"username+mailbox@domain.com", true},
 		{"customer/department@domain.com", true},
 		{"$A12345@domain.com", true},

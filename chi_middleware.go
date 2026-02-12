@@ -28,19 +28,29 @@ func NewChiMiddleware(cfg *Config) *AuthMiddleware {
 
 func (am *AuthMiddleware) VerifyAuthenticationToken(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var jwtToken string
+
+		// Try Authorization header first
 		authHeader := r.Header.Get("Authorization")
-		if authHeader == "" {
+		if authHeader != "" {
+			splitToken := strings.Split(authHeader, "Bearer ")
+			if len(splitToken) == 2 {
+				jwtToken = splitToken[1]
+			}
+		}
+
+		// Fall back to cookie if header not present
+		if jwtToken == "" {
+			if cookie, err := r.Cookie("access_token"); err == nil {
+				jwtToken = cookie.Value
+			}
+		}
+
+		if jwtToken == "" {
 			http.Error(w, ErrorAuthHeaderMissing.Error(), http.StatusUnauthorized)
 			return
 		}
 
-		splitToken := strings.Split(authHeader, "Bearer ")
-		if len(splitToken) != 2 {
-			http.Error(w, ErrorInvalidAuthHeader.Error(), http.StatusUnauthorized)
-			return
-		}
-
-		jwtToken := splitToken[1]
 		claims, err := parseTokenString(jwtToken, am.Cfg.AccessTokenSecret)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusUnauthorized)
