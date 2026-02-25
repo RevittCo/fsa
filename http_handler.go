@@ -32,31 +32,37 @@ func (h *Handler) SetupRoutes(router chi.Router) {
 		if h.auth.Cfg.RateLimitPerSecond > 0 {
 			r.Use(tollbooth_chi.LimitHandler(limiter))
 		}
-		r.Get("/auth/login", h.Login)
-		r.Get("/auth/confirm", h.ConfirmCode)
+		r.Post("/auth/login", h.Login)
+		r.Post("/auth/confirm", h.ConfirmCode)
 		r.Post("/auth/refresh", h.RefreshToken)
 		r.Post("/auth/logout", h.Logout)
 	})
 }
 
 func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
-	email := r.URL.Query().Get("email")
-	returnUrl := r.URL.Query().Get("returnUrl")
+	var req struct {
+		Email     string `json:"email"`
+		ReturnUrl string `json:"returnUrl"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		WriteErr(w, fmt.Errorf("invalid request body"), http.StatusBadRequest)
+		return
+	}
 
 	ctx := r.Context()
 
-	if len(email) == 0 {
+	if len(req.Email) == 0 {
 		WriteErr(w, fmt.Errorf("email required"), http.StatusBadRequest)
 		return
 	}
 
-	if len(returnUrl) == 0 {
-		returnUrl = h.auth.Cfg.ReturnUrls[0]
+	if len(req.ReturnUrl) == 0 {
+		req.ReturnUrl = h.auth.Cfg.ReturnUrls[0]
 	}
 
 	validReturnUrl := false
 	for _, url := range h.auth.Cfg.ReturnUrls {
-		if url == returnUrl {
+		if url == req.ReturnUrl {
 			validReturnUrl = true
 			break
 		}
@@ -67,7 +73,7 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := h.auth.LoginStep1SendVerificationCode(ctx, email, returnUrl)
+	err := h.auth.LoginStep1SendVerificationCode(ctx, req.Email, req.ReturnUrl)
 	if err != nil {
 		WriteErr(w, err, http.StatusInternalServerError)
 		return
@@ -77,17 +83,23 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ConfirmCode(w http.ResponseWriter, r *http.Request) {
-	code := r.URL.Query().Get("code")
-	email := r.URL.Query().Get("email")
+	var req struct {
+		Code  string `json:"code"`
+		Email string `json:"email"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		WriteErr(w, fmt.Errorf("invalid request body"), http.StatusBadRequest)
+		return
+	}
 
 	ctx := r.Context()
 
-	if len(code) == 0 || len(email) == 0 {
+	if len(req.Code) == 0 || len(req.Email) == 0 {
 		WriteErr(w, fmt.Errorf("code and email required"), http.StatusBadRequest)
 		return
 	}
 
-	confirmed, tokens, err := h.auth.LoginStep2ConfirmCode(ctx, email, code)
+	confirmed, tokens, err := h.auth.LoginStep2ConfirmCode(ctx, req.Email, req.Code)
 	if err != nil {
 		WriteErr(w, err, http.StatusInternalServerError)
 		return
@@ -104,23 +116,16 @@ func (h *Handler) ConfirmCode(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) RefreshToken(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Token string `json:"token"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteErr(w, fmt.Errorf("invalid request body"), http.StatusBadRequest)
-		return
-	}
-
-	if len(req.Token) == 0 {
-		WriteErr(w, fmt.Errorf("token required"), http.StatusBadRequest)
+	cookie, err := r.Cookie("refresh_token")
+	if err != nil {
+		WriteErr(w, fmt.Errorf("refresh token required"), http.StatusUnauthorized)
 		return
 	}
 
 	ctx := r.Context()
-	tokens, err := h.auth.RefreshToken(ctx, req.Token)
+	tokens, err := h.auth.RefreshToken(ctx, cookie.Value)
 	if err != nil {
-		WriteErr(w, err, http.StatusInternalServerError)
+		WriteErr(w, err, http.StatusUnauthorized)
 		return
 	}
 

@@ -46,9 +46,10 @@ const UserEmailKey Key = "userEmail"
 const UserIdKey Key = "userId"
 
 type CookieConfig struct {
-	Domain   string        // For cross-subdomain auth
-	Secure   bool          // HTTPS only (default: true)
-	SameSite http.SameSite // Default: SameSiteStrictMode
+	Domain      string        // For cross-subdomain auth
+	Secure      bool          // HTTPS only (default: true)
+	SameSite    http.SameSite // Default: SameSiteStrictMode
+	RefreshPath string        // Cookie path for refresh token. Default: "/auth/refresh"
 }
 
 type CSRFConfig struct {

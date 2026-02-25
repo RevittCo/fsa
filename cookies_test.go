@@ -243,6 +243,61 @@ func TestSetTokenCookies_SetsRefreshTokenSecureAndDomain(t *testing.T) {
 	}
 }
 
+func TestSetTokenCookies_UsesCustomRefreshPath(t *testing.T) {
+	auth := createTestAuthWithConfig(&Config{
+		ReturnUrls:                 []string{"https://app.com/login"},
+		AccessTokenSecret:          "secret",
+		RefreshTokenSecret:         "secret",
+		CodeValidityPeriod:         5 * time.Minute,
+		AccessTokenValidityPeriod:  1 * time.Hour,
+		RefreshTokenValidityPeriod: 24 * time.Hour,
+		CookieConfig:               &CookieConfig{Secure: true, RefreshPath: "/api/v1/auth/refresh"},
+	})
+
+	tokens := &TokenResponse{
+		AccessToken:  &Token{Token: "access123", TokenExpiry: time.Now().Add(time.Hour)},
+		RefreshToken: &Token{Token: "refresh123", TokenExpiry: time.Now().Add(24 * time.Hour)},
+	}
+
+	w := httptest.NewRecorder()
+	auth.SetTokenCookies(w, tokens)
+
+	cookies := w.Result().Cookies()
+	refreshCookie := findCookie(cookies, "refresh_token")
+
+	if refreshCookie == nil {
+		t.Fatal("expected refresh_token cookie")
+	}
+	if refreshCookie.Path != "/api/v1/auth/refresh" {
+		t.Errorf("expected path '/api/v1/auth/refresh', got '%s'", refreshCookie.Path)
+	}
+}
+
+func TestClearTokenCookies_UsesCustomRefreshPath(t *testing.T) {
+	auth := createTestAuthWithConfig(&Config{
+		ReturnUrls:                 []string{"https://app.com/login"},
+		AccessTokenSecret:          "secret",
+		RefreshTokenSecret:         "secret",
+		CodeValidityPeriod:         5 * time.Minute,
+		AccessTokenValidityPeriod:  1 * time.Hour,
+		RefreshTokenValidityPeriod: 24 * time.Hour,
+		CookieConfig:               &CookieConfig{Secure: true, RefreshPath: "/api/v1/auth/refresh"},
+	})
+
+	w := httptest.NewRecorder()
+	auth.ClearTokenCookies(w)
+
+	cookies := w.Result().Cookies()
+	refreshCookie := findCookie(cookies, "refresh_token")
+
+	if refreshCookie == nil {
+		t.Fatal("expected refresh_token cookie")
+	}
+	if refreshCookie.Path != "/api/v1/auth/refresh" {
+		t.Errorf("expected path '/api/v1/auth/refresh', got '%s'", refreshCookie.Path)
+	}
+}
+
 func TestClearTokenCookies_ExpiresAllTokenCookies(t *testing.T) {
 	auth := createTestAuth()
 
