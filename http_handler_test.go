@@ -95,6 +95,31 @@ func TestLogin_DefaultsReturnUrl(t *testing.T) {
 	}
 }
 
+func TestLogin_RejectsEmptyReturnUrlsConfig(t *testing.T) {
+	auth := createTestAuthWithConfig(&Config{
+		AppName:                    "TestApp",
+		ReturnUrls:                 []string{},
+		AccessTokenSecret:          "test-access-secret",
+		RefreshTokenSecret:         "test-refresh-secret",
+		CodeValidityPeriod:         5 * time.Minute,
+		AccessTokenValidityPeriod:  1 * time.Hour,
+		RefreshTokenValidityPeriod: 24 * time.Hour,
+	})
+	r := chi.NewRouter()
+	NewHandler(r, auth)
+
+	body := `{"email":"test@example.com"}`
+	req := httptest.NewRequest("POST", "/auth/login", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected status BadRequest, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 func TestLogin_RejectsGET(t *testing.T) {
 	router, _ := createTestHandlerWithRouter()
 

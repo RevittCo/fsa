@@ -57,6 +57,10 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(req.ReturnUrl) == 0 {
+		if len(h.auth.Cfg.ReturnUrls) == 0 {
+			WriteErr(w, fmt.Errorf("returnUrl required and no defaults configured"), http.StatusBadRequest)
+			return
+		}
 		req.ReturnUrl = h.auth.Cfg.ReturnUrls[0]
 	}
 
