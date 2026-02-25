@@ -25,6 +25,126 @@ func createTestHandlerWithRouter() (http.Handler, *Auth) {
 	return r, auth
 }
 
+// Phase 1: Login handler tests
+
+func TestLogin_SendsVerificationCode(t *testing.T) {
+	router, _ := createTestHandlerWithRouter()
+
+	req := httptest.NewRequest("GET", "/auth/login?email=test@example.com&returnUrl=https://app.com/login", nil)
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status OK, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var response string
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if response != "ok" {
+		t.Errorf("expected response 'ok', got '%s'", response)
+	}
+}
+
+func TestLogin_RejectsMissingEmail(t *testing.T) {
+	router, _ := createTestHandlerWithRouter()
+
+	req := httptest.NewRequest("GET", "/auth/login", nil)
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected status BadRequest, got %d", w.Code)
+	}
+}
+
+func TestLogin_RejectsInvalidReturnUrl(t *testing.T) {
+	router, _ := createTestHandlerWithRouter()
+
+	req := httptest.NewRequest("GET", "/auth/login?email=test@example.com&returnUrl=https://evil.com/login", nil)
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected status BadRequest, got %d", w.Code)
+	}
+}
+
+func TestLogin_DefaultsReturnUrl(t *testing.T) {
+	router, _ := createTestHandlerWithRouter()
+
+	req := httptest.NewRequest("GET", "/auth/login?email=test@example.com", nil)
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected status OK, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestConfirmCode_RejectsMissingParams(t *testing.T) {
+	router, _ := createTestHandlerWithRouter()
+
+	req := httptest.NewRequest("GET", "/auth/confirm", nil)
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected status BadRequest, got %d", w.Code)
+	}
+}
+
+func TestConfirmCode_RejectsWrongCode(t *testing.T) {
+	router, auth := createTestHandlerWithRouter()
+
+	email := "test@example.com"
+	err := auth.Db.StoreVerificationCode(email, "123456", time.Now().Add(5*time.Minute))
+	if err != nil {
+		t.Fatalf("failed to store verification code: %v", err)
+	}
+
+	req := httptest.NewRequest("GET", "/auth/confirm?code=000000&email="+email, nil)
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected status BadRequest, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestRefreshToken_RejectsExpiredToken(t *testing.T) {
+	router, auth := createTestHandlerWithRouter()
+
+	// Create an expired refresh token
+	expiredToken, err := createRefreshToken(
+		mustParseUUID("550e8400-e29b-41d4-a716-446655440000"),
+		"test@example.com",
+		auth.Cfg.RefreshTokenSecret,
+		-1*time.Hour,
+	)
+	if err != nil {
+		t.Fatalf("failed to create refresh token: %v", err)
+	}
+
+	body := `{"token": "` + expiredToken.Token + `"}`
+	req := httptest.NewRequest("POST", "/auth/refresh", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected status 500, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 // Phase 2: POST Refresh Tests
 
 func TestRefreshToken_POSTMethod(t *testing.T) {

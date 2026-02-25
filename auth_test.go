@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // Phase 1: URL Encoding Tests
@@ -135,6 +137,103 @@ func TestLoginStep1_ErrorsWhenNoReturnUrlsConfigured(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "no defaults configured") {
 		t.Errorf("expected 'no defaults configured' error, got: %v", err)
+	}
+}
+
+func TestLoginStep2_RejectsWrongCode(t *testing.T) {
+	auth := createTestAuth()
+	email := "test@example.com"
+	err := auth.Db.StoreVerificationCode(email, "123456", time.Now().Add(5*time.Minute))
+	if err != nil {
+		t.Fatalf("failed to store code: %v", err)
+	}
+
+	confirmed, tokens, err := auth.LoginStep2ConfirmCode(context.Background(), email, "000000")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if confirmed {
+		t.Error("expected confirmed to be false for wrong code")
+	}
+	if tokens != nil {
+		t.Error("expected tokens to be nil for wrong code")
+	}
+}
+
+func TestLoginStep2_RejectsExpiredCode(t *testing.T) {
+	auth := createTestAuth()
+	email := "test@example.com"
+	err := auth.Db.StoreVerificationCode(email, "123456", time.Now().Add(-1*time.Minute))
+	if err != nil {
+		t.Fatalf("failed to store code: %v", err)
+	}
+
+	confirmed, tokens, err := auth.LoginStep2ConfirmCode(context.Background(), email, "123456")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if confirmed {
+		t.Error("expected confirmed to be false for expired code")
+	}
+	if tokens != nil {
+		t.Error("expected tokens to be nil for expired code")
+	}
+}
+
+func TestRefreshToken_RejectsExpiredJWT(t *testing.T) {
+	auth := createTestAuth()
+
+	// Create an expired refresh token
+	expiredToken, err := createRefreshToken(
+		uuid.New(),
+		"test@example.com",
+		auth.Cfg.RefreshTokenSecret,
+		-1*time.Hour, // already expired
+	)
+	if err != nil {
+		t.Fatalf("failed to create token: %v", err)
+	}
+
+	_, err = auth.RefreshToken(context.Background(), expiredToken.Token)
+	if err == nil {
+		t.Error("expected error for expired JWT")
+	}
+}
+
+func TestRefreshToken_RejectsInvalidJWT(t *testing.T) {
+	auth := createTestAuth()
+
+	_, err := auth.RefreshToken(context.Background(), "not-a-valid-jwt")
+	if err == nil {
+		t.Error("expected error for invalid JWT")
+	}
+}
+
+func TestRefreshToken_ReturnsNewTokenPair(t *testing.T) {
+	auth := createTestAuth()
+
+	refreshToken, err := createRefreshToken(
+		uuid.New(),
+		"test@example.com",
+		auth.Cfg.RefreshTokenSecret,
+		auth.Cfg.RefreshTokenValidityPeriod,
+	)
+	if err != nil {
+		t.Fatalf("failed to create token: %v", err)
+	}
+
+	tokens, err := auth.RefreshToken(context.Background(), refreshToken.Token)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if tokens == nil {
+		t.Fatal("expected non-nil token response")
+	}
+	if tokens.AccessToken == nil || tokens.AccessToken.Token == "" {
+		t.Error("expected non-empty access token")
+	}
+	if tokens.RefreshToken == nil || tokens.RefreshToken.Token == "" {
+		t.Error("expected non-empty refresh token")
 	}
 }
 
