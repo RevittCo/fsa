@@ -1,4 +1,4 @@
-module github.com/revittco/fsa/v3
+module github.com/revittco/fsa/v4
 
 go 1.26
 
