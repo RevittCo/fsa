@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/golang-jwt/jwt/v4"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 )
 
@@ -41,11 +41,11 @@ func createTestAuth() *Auth {
 }
 
 func createTestAuthWithConfig(cfg *Config) *Auth {
-	return New(NewMemDb(), &MockSender{}, &MockUserCreator{}, NewEmailValidator(), nil, nil, cfg)
+	return New(NewMemDb(), &MockSender{}, &MockUserCreator{}, NewEmailValidator(), nil, NewMemRefreshTokenStore(), nil, cfg)
 }
 
 func createTestAuthWithMockSender(sender *MockSender) *Auth {
-	return New(NewMemDb(), sender, &MockUserCreator{}, NewEmailValidator(), nil, nil, &Config{
+	return New(NewMemDb(), sender, &MockUserCreator{}, NewEmailValidator(), nil, NewMemRefreshTokenStore(), nil, &Config{
 		AppName:                    "TestApp",
 		ReturnUrls:                 []string{"https://app.com/login"},
 		AccessTokenSecret:          "test-access-secret",

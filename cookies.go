@@ -13,7 +13,7 @@ func (a *Auth) SetTokenCookies(w http.ResponseWriter, tokens *TokenResponse) {
 
 	refreshPath := cfg.RefreshPath
 	if refreshPath == "" {
-		refreshPath = "/auth/refresh"
+		refreshPath = a.Cfg.resolvedPrefix() + "/refresh"
 	}
 
 	http.SetCookie(w, &http.Cookie{
@@ -47,7 +47,7 @@ func (a *Auth) ClearTokenCookies(w http.ResponseWriter) {
 
 	refreshPath := cfg.RefreshPath
 	if refreshPath == "" {
-		refreshPath = "/auth/refresh"
+		refreshPath = a.Cfg.resolvedPrefix() + "/refresh"
 	}
 
 	expired := time.Now().Add(-24 * time.Hour)

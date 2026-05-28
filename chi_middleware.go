@@ -8,7 +8,8 @@ import (
 
 	"fmt"
 
-	"github.com/golang-jwt/jwt/v4"
+	"github.com/go-chi/cors"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 var (
@@ -61,6 +62,36 @@ func (am *AuthMiddleware) VerifyAuthenticationToken(next http.Handler) http.Hand
 		ctx = context.WithValue(ctx, UserEmailKey, claims["email"])
 		ctx = context.WithValue(ctx, UserIdKey, claims["id"])
 		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// NewCORSMiddleware builds a CORS middleware from the given CORSConfig. If
+// cfg is nil it returns a no-op pass-through; callers usually shouldn't pass
+// nil but the guard keeps it safe.
+func NewCORSMiddleware(cfg *CORSConfig) func(http.Handler) http.Handler {
+	if cfg == nil {
+		return func(next http.Handler) http.Handler { return next }
+	}
+
+	methods := cfg.AllowedMethods
+	if len(methods) == 0 {
+		methods = []string{http.MethodGet, http.MethodPost, http.MethodOptions}
+	}
+	headers := cfg.AllowedHeaders
+	if len(headers) == 0 {
+		headers = []string{"Authorization", "Content-Type", "X-CSRF-Token"}
+	}
+	maxAge := cfg.MaxAge
+	if maxAge == 0 {
+		maxAge = 600
+	}
+
+	return cors.Handler(cors.Options{
+		AllowedOrigins:   cfg.AllowedOrigins,
+		AllowedMethods:   methods,
+		AllowedHeaders:   headers,
+		AllowCredentials: cfg.AllowCredentials,
+		MaxAge:           maxAge,
 	})
 }
 

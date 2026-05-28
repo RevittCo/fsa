@@ -3,17 +3,17 @@ package fsa
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"fmt"
 	"html/template"
-	"math/rand"
+	"math/big"
 	"net/http"
 	"net/url"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"time"
 
-	"github.com/golang-jwt/jwt/v4"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 )
 
@@ -39,6 +39,19 @@ type IUserIdentityVerifier interface {
 	CanLogin(email string) (bool, string, error)
 }
 
+// IRefreshTokenStore tracks the lifecycle of refresh tokens by their jti claim.
+// Implementations must be safe for concurrent use.
+type IRefreshTokenStore interface {
+	// MarkIssued records a newly minted refresh token so it can later be
+	// validated and rotated. expiresAt is the token's exp claim.
+	MarkIssued(ctx context.Context, jti string, userID uuid.UUID, expiresAt time.Time) error
+	// MarkUsed atomically marks a refresh token's jti as used. It returns
+	// alreadyUsed=true if the jti had been used before (replay attempt).
+	// An unknown jti is treated as already-used: tokens that were never
+	// issued (or that have expired and been swept) must not be honoured.
+	MarkUsed(ctx context.Context, jti string) (alreadyUsed bool, err error)
+}
+
 type Key string
 
 const ClaimsKey Key = "claims"
@@ -49,7 +62,7 @@ type CookieConfig struct {
 	Domain      string        // For cross-subdomain auth
 	Secure      bool          // HTTPS only (default: true)
 	SameSite    http.SameSite // Default: SameSiteStrictMode
-	RefreshPath string        // Cookie path for refresh token. Default: "/auth/refresh"
+	RefreshPath string        // Cookie path for refresh token. Defaults to Config.Prefix + "/refresh".
 }
 
 type CSRFConfig struct {
@@ -58,11 +71,25 @@ type CSRFConfig struct {
 	TokenLength int    // Default: 32
 }
 
+// CORSConfig configures CORS handling on the bundled auth routes. If nil on
+// Config, no CORS middleware is installed.
+type CORSConfig struct {
+	AllowedOrigins   []string // exact matches; "*" disables credentials
+	AllowedMethods   []string // default: GET, POST, OPTIONS
+	AllowedHeaders   []string // default: Authorization, Content-Type, X-CSRF-Token
+	AllowCredentials bool     // default: true
+	MaxAge           int      // preflight cache seconds; default: 600
+}
+
 type Config struct {
 	AppName   string
 	Logo      string
 	Brand     string
 	BrandLink string
+
+	// Prefix is the route prefix for the bundled auth handlers
+	// (login/confirm/refresh/logout). Default: "/auth".
+	Prefix string
 
 	CodeValidityPeriod         time.Duration
 	AccessTokenValidityPeriod  time.Duration
@@ -71,7 +98,14 @@ type Config struct {
 	AccessTokenSecret  string
 	RefreshTokenSecret string
 
+	// RateLimitPerSecond is the per-IP rate limit for the bundled auth routes.
+	// 0 disables the per-IP limiter.
 	RateLimitPerSecond int
+
+	// LoginRateLimitPerEmailPerHour caps how many login + confirm attempts
+	// a single email address may make per rolling hour, across all IPs.
+	// 0 disables per-email rate limiting.
+	LoginRateLimitPerEmailPerHour int
 
 	ReturnUrls []string
 
@@ -79,6 +113,13 @@ type Config struct {
 
 	CookieConfig *CookieConfig // Optional, uses secure defaults if nil
 	CSRFConfig   *CSRFConfig   // Optional, uses defaults if nil
+	CORSConfig   *CORSConfig   // Optional, no CORS middleware if nil
+
+	// EnrichClaims, when set, is called when minting an access token. The
+	// returned map is merged into the base claims ({id, email, exp}). The
+	// base claim keys "id", "email", "exp" cannot be overwritten — colliding
+	// keys in the returned map are dropped.
+	EnrichClaims func(ctx context.Context, userID uuid.UUID, email string) (map[string]any, error)
 }
 
 type Token struct {
@@ -103,33 +144,41 @@ type EmailData struct {
 }
 
 type Auth struct {
-	Db     IAuthDb
-	Sender ICodeSender
-	Uc     IUserCreator
-	Ev     IEmailValidator
-	Uiv    IUserIdentityVerifier
+	Db                IAuthDb
+	Sender            ICodeSender
+	Uc                IUserCreator
+	Ev                IEmailValidator
+	Uiv               IUserIdentityVerifier
+	RefreshTokenStore IRefreshTokenStore
 
 	EmailTemplate *template.Template
 
 	Cfg *Config
+
+	emailLimiter *emailRateLimiter
 }
 
-func New(db IAuthDb, sender ICodeSender, uc IUserCreator, ev IEmailValidator, uiv IUserIdentityVerifier, et *template.Template, cfg *Config) *Auth {
-	return &Auth{
-		Db:     db,
-		Sender: sender,
-		Uc:     uc,
-		Ev:     ev,
-		Uiv:    uiv,
+func New(db IAuthDb, sender ICodeSender, uc IUserCreator, ev IEmailValidator, uiv IUserIdentityVerifier, rts IRefreshTokenStore, et *template.Template, cfg *Config) *Auth {
+	a := &Auth{
+		Db:                db,
+		Sender:            sender,
+		Uc:                uc,
+		Ev:                ev,
+		Uiv:               uiv,
+		RefreshTokenStore: rts,
 
 		EmailTemplate: et,
 
 		Cfg: cfg,
 	}
+	if cfg != nil && cfg.LoginRateLimitPerEmailPerHour > 0 {
+		a.emailLimiter = newEmailRateLimiter(cfg.LoginRateLimitPerEmailPerHour, time.Hour)
+	}
+	return a
 }
 
 func NewWithMemDbAndDefaultTemplate(sender ICodeSender, uc IUserCreator, cfg *Config) *Auth {
-	return New(NewMemDb(), sender, uc, NewEmailValidator(), NewUserIdentityVerifier(), nil, cfg)
+	return New(NewMemDb(), sender, uc, NewEmailValidator(), NewUserIdentityVerifier(), NewMemRefreshTokenStore(), nil, cfg)
 }
 
 func (a *Auth) LoginStep1SendVerificationCode(ctx context.Context, email, returnUrl string) error {
@@ -165,10 +214,13 @@ func (a *Auth) LoginStep1SendVerificationCode(ctx context.Context, email, return
 		}
 	}
 
-	code := generateCode()
+	code, err := generateCode()
+	if err != nil {
+		return fmt.Errorf("generate code: %w", err)
+	}
 	expiresAt := time.Now().Add(a.Cfg.CodeValidityPeriod)
 
-	err := a.Db.StoreVerificationCode(email, code, expiresAt)
+	err = a.Db.StoreVerificationCode(email, code, expiresAt)
 	if err != nil {
 		return err
 	}
@@ -207,17 +259,20 @@ func (a *Auth) LoginStep2ConfirmCode(ctx context.Context, email string, code str
 		return false, nil, err
 	}
 
-	accessToken, err := createToken(map[string]interface{}{
-		"id":    id,
-		"email": email,
-	}, a.Cfg.AccessTokenSecret, a.Cfg.AccessTokenValidityPeriod)
+	accessToken, err := a.mintAccessToken(ctx, id, email)
 	if err != nil {
 		return false, nil, err
 	}
 
-	refreshToken, err := createRefreshToken(id, email, a.Cfg.RefreshTokenSecret, a.Cfg.RefreshTokenValidityPeriod)
+	refreshToken, jti, refreshExpiresAt, err := createRefreshToken(id, email, a.Cfg.RefreshTokenSecret, a.Cfg.RefreshTokenValidityPeriod)
 	if err != nil {
 		return false, nil, err
+	}
+
+	if a.RefreshTokenStore != nil {
+		if err := a.RefreshTokenStore.MarkIssued(ctx, jti, id, refreshExpiresAt); err != nil {
+			return false, nil, fmt.Errorf("record refresh token: %w", err)
+		}
 	}
 
 	return true, &TokenResponse{
@@ -228,6 +283,9 @@ func (a *Auth) LoginStep2ConfirmCode(ctx context.Context, email string, code str
 
 func (a *Auth) RefreshToken(ctx context.Context, rt string) (*TokenResponse, error) {
 	token, err := jwt.Parse(rt, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
 		return []byte(a.Cfg.RefreshTokenSecret), nil
 	})
 	if err != nil {
@@ -235,7 +293,7 @@ func (a *Auth) RefreshToken(ctx context.Context, rt string) (*TokenResponse, err
 	}
 
 	claims, ok := token.Claims.(jwt.MapClaims)
-	if !ok {
+	if !ok || !token.Valid {
 		return nil, fmt.Errorf("invalid claims")
 	}
 
@@ -254,17 +312,34 @@ func (a *Auth) RefreshToken(ctx context.Context, rt string) (*TokenResponse, err
 		return nil, err
 	}
 
-	accessToken, err := createToken(map[string]interface{}{
-		"id":    id,
-		"email": email,
-	}, a.Cfg.AccessTokenSecret, a.Cfg.AccessTokenValidityPeriod)
+	if a.RefreshTokenStore != nil {
+		jti, _ := claims["jti"].(string)
+		if jti == "" {
+			return nil, fmt.Errorf("refresh token missing jti")
+		}
+		alreadyUsed, err := a.RefreshTokenStore.MarkUsed(ctx, jti)
+		if err != nil {
+			return nil, fmt.Errorf("refresh-token store: %w", err)
+		}
+		if alreadyUsed {
+			return nil, fmt.Errorf("refresh token already used")
+		}
+	}
+
+	accessToken, err := a.mintAccessToken(ctx, idUUID, email)
 	if err != nil {
 		return nil, err
 	}
 
-	refreshToken, err := createRefreshToken(idUUID, email, a.Cfg.RefreshTokenSecret, a.Cfg.RefreshTokenValidityPeriod)
+	refreshToken, newJti, refreshExpiresAt, err := createRefreshToken(idUUID, email, a.Cfg.RefreshTokenSecret, a.Cfg.RefreshTokenValidityPeriod)
 	if err != nil {
 		return nil, err
+	}
+
+	if a.RefreshTokenStore != nil {
+		if err := a.RefreshTokenStore.MarkIssued(ctx, newJti, idUUID, refreshExpiresAt); err != nil {
+			return nil, fmt.Errorf("record refresh token: %w", err)
+		}
 	}
 
 	return &TokenResponse{
@@ -273,23 +348,40 @@ func (a *Auth) RefreshToken(ctx context.Context, rt string) (*TokenResponse, err
 	}, nil
 }
 
-func generateCode() string {
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-
-	var code string
-	for i := 0; i < 6; i++ {
-		code += strconv.Itoa(r.Intn(10))
+func (a *Auth) mintAccessToken(ctx context.Context, id uuid.UUID, email string) (*Token, error) {
+	claims := map[string]interface{}{
+		"id":    id.String(),
+		"email": email,
 	}
-	return code
+	if a.Cfg.EnrichClaims != nil {
+		extra, err := a.Cfg.EnrichClaims(ctx, id, email)
+		if err != nil {
+			return nil, fmt.Errorf("enrich claims: %w", err)
+		}
+		for k, v := range extra {
+			if k == "id" || k == "email" || k == "exp" {
+				continue
+			}
+			claims[k] = v
+		}
+	}
+	return createToken(claims, a.Cfg.AccessTokenSecret, a.Cfg.AccessTokenValidityPeriod)
+}
+
+// generateCode returns a six-digit numeric verification code using crypto/rand.
+func generateCode() (string, error) {
+	n, err := rand.Int(rand.Reader, big.NewInt(1_000_000))
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%06d", n.Int64()), nil
 }
 
 func createToken(claims map[string]interface{}, secret string, validityPeriod time.Duration) (*Token, error) {
-	token := jwt.New(jwt.SigningMethodHS256)
-
 	expiresAt := time.Now().Add(validityPeriod)
 
 	claims["exp"] = expiresAt.Unix()
-	token.Claims = jwt.MapClaims(claims)
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims(claims))
 
 	mySigningKey := []byte(secret)
 	str, err := token.SignedString(mySigningKey)
@@ -303,28 +395,29 @@ func createToken(claims map[string]interface{}, secret string, validityPeriod ti
 	}, nil
 }
 
-func createRefreshToken(id uuid.UUID, email, secret string, validityPeriod time.Duration) (*Token, error) {
-	token := jwt.New(jwt.SigningMethodHS256)
-
+// createRefreshToken signs a refresh token, returning the *Token, the jti
+// claim used, and the expiry timestamp.
+func createRefreshToken(id uuid.UUID, email, secret string, validityPeriod time.Duration) (*Token, string, time.Time, error) {
 	expiresAt := time.Now().Add(validityPeriod)
+	jti := uuid.NewString()
 
 	claims := jwt.MapClaims{
 		"id":    id.String(),
 		"email": email,
 		"exp":   expiresAt.Unix(),
+		"jti":   jti,
 	}
-	token.Claims = claims
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 
-	mySigningKey := []byte(secret)
-	str, err := token.SignedString(mySigningKey)
+	str, err := token.SignedString([]byte(secret))
 	if err != nil {
-		return nil, err
+		return nil, "", time.Time{}, err
 	}
 
 	return &Token{
 		Token:       str,
 		TokenExpiry: expiresAt,
-	}, nil
+	}, jti, expiresAt, nil
 }
 
 func (a *Auth) ParseTemplate(link, code string) string {
@@ -363,4 +456,12 @@ func (a *Auth) ParseTemplate(link, code string) string {
 	}
 
 	return body.String()
+}
+
+// resolvedPrefix returns the configured auth route prefix, defaulting to /auth.
+func (c *Config) resolvedPrefix() string {
+	if c == nil || c.Prefix == "" {
+		return "/auth"
+	}
+	return c.Prefix
 }
