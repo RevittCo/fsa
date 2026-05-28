@@ -2,6 +2,7 @@ package fsa
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -54,7 +55,8 @@ func TestRefreshToken_RejectsReplay(t *testing.T) {
 		t.Fatalf("mark issued: %v", err)
 	}
 
-	if _, err := auth.RefreshToken(context.Background(), rt.Token); err != nil {
+	rotated, err := auth.RefreshToken(context.Background(), rt.Token)
+	if err != nil {
 		t.Fatalf("first use unexpectedly failed: %v", err)
 	}
 
@@ -64,6 +66,19 @@ func TestRefreshToken_RejectsReplay(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "already used") {
 		t.Errorf("expected 'already used' error, got: %v", err)
+	}
+
+	// The rotated refresh token must itself be honoured exactly once —
+	// chain continuity is the whole point of rotation.
+	rotated2, err := auth.RefreshToken(context.Background(), rotated.RefreshToken.Token)
+	if err != nil {
+		t.Fatalf("rotated refresh token should be valid: %v", err)
+	}
+	if rotated2.RefreshToken.Token == rotated.RefreshToken.Token {
+		t.Error("rotation must produce a new refresh token")
+	}
+	if _, err := auth.RefreshToken(context.Background(), rotated.RefreshToken.Token); err == nil {
+		t.Error("rotated token must also reject replay")
 	}
 }
 
@@ -173,6 +188,52 @@ func TestEnrichClaims_ErrorPropagates(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "enrich claims") {
 		t.Errorf("expected wrapped enrich error, got: %v", err)
+	}
+}
+
+func TestEnrichClaims_AppliedOnRotation(t *testing.T) {
+	var calls int
+	cfg := &Config{
+		AppName:                    "TestApp",
+		ReturnUrls:                 []string{"https://app.com/login"},
+		AccessTokenSecret:          "test-access-secret",
+		RefreshTokenSecret:         "test-refresh-secret",
+		CodeValidityPeriod:         5 * time.Minute,
+		AccessTokenValidityPeriod:  1 * time.Hour,
+		RefreshTokenValidityPeriod: 24 * time.Hour,
+		EnrichClaims: func(ctx context.Context, id uuid.UUID, email string) (map[string]any, error) {
+			calls++
+			return map[string]any{"role": "admin"}, nil
+		},
+	}
+	auth := createTestAuthWithConfig(cfg)
+
+	userID := uuid.New()
+	rt, jti, exp, err := createRefreshToken(userID, "rotate-claims@example.com", cfg.RefreshTokenSecret, cfg.RefreshTokenValidityPeriod)
+	if err != nil {
+		t.Fatalf("create token: %v", err)
+	}
+	if err := auth.RefreshTokenStore.MarkIssued(context.Background(), jti, userID, exp); err != nil {
+		t.Fatalf("mark issued: %v", err)
+	}
+
+	tokens, err := auth.RefreshToken(context.Background(), rt.Token)
+	if err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("expected EnrichClaims called once on rotation, got %d", calls)
+	}
+
+	parsed, err := jwt.Parse(tokens.AccessToken.Token, func(t *jwt.Token) (interface{}, error) {
+		return []byte(cfg.AccessTokenSecret), nil
+	})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	claims := parsed.Claims.(jwt.MapClaims)
+	if claims["role"] != "admin" {
+		t.Errorf("rotated access token missing enriched role, got %v", claims["role"])
 	}
 }
 
@@ -319,13 +380,111 @@ func TestCORS_AddsHeadersOnPreflight(t *testing.T) {
 	}
 }
 
+// --- prefix normalization ---
+
+func TestResolvedPrefix_Normalization(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"", "/auth"},
+		{"/", "/auth"},
+		{"/auth", "/auth"},
+		{"/auth/", "/auth"},
+		{"auth", "/auth"},
+		{"auth/", "/auth"},
+		{"/api/v1/auth/", "/api/v1/auth"},
+		{"api/v1/auth", "/api/v1/auth"},
+	}
+	for _, c := range cases {
+		got := (&Config{Prefix: c.in}).resolvedPrefix()
+		if got != c.want {
+			t.Errorf("Prefix=%q: got %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// --- email-limiter normalization & cap ---
+
+func TestEmailRateLimiter_CaseInsensitive(t *testing.T) {
+	l := newEmailRateLimiter(2, time.Hour)
+	if !l.allow("User@Example.com") {
+		t.Fatal("first attempt should pass")
+	}
+	if !l.allow("user@example.com") {
+		t.Fatal("second attempt (different case) should share bucket and pass")
+	}
+	if l.allow("USER@EXAMPLE.COM") {
+		t.Fatal("third attempt should be rejected — case must not bypass the bucket")
+	}
+}
+
+func TestEmailRateLimiter_CapRejectsNewKeysWhenFull(t *testing.T) {
+	l := newEmailRateLimiter(10, time.Hour)
+	l.maxEntries = 3
+
+	// Fill the map with three distinct emails.
+	for i, e := range []string{"a@x.com", "b@x.com", "c@x.com"} {
+		if !l.allow(e) {
+			t.Fatalf("seed %d (%s) should be allowed", i, e)
+		}
+	}
+	if got := len(l.hits); got != 3 {
+		t.Fatalf("expected 3 buckets, got %d", got)
+	}
+
+	// A new key when the map is at the cap must be rejected — and must NOT
+	// evict an established entry (that would let an attacker erase tracking).
+	if l.allow("d@x.com") {
+		t.Fatal("new key beyond cap should be rejected")
+	}
+	if _, ok := l.hits["d@x.com"]; ok {
+		t.Error("rejected key must not be inserted")
+	}
+	for _, e := range []string{"a@x.com", "b@x.com", "c@x.com"} {
+		if _, ok := l.hits[e]; !ok {
+			t.Errorf("established bucket %s must not be evicted by cap pressure", e)
+		}
+	}
+
+	// Existing keys must still be able to increment up to their per-email
+	// limit — the cap only blocks *new* keys.
+	if !l.allow("a@x.com") {
+		t.Error("established key should still be allowed under the cap")
+	}
+}
+
+func TestEmailRateLimiter_CapAllowsNewKeyAfterGCFreesSlot(t *testing.T) {
+	l := newEmailRateLimiter(10, 10*time.Millisecond)
+	l.maxEntries = 2
+
+	if !l.allow("old@x.com") {
+		t.Fatal("first key should be allowed")
+	}
+	if !l.allow("also@x.com") {
+		t.Fatal("second key should be allowed")
+	}
+	// Map is at cap; let the window expire so GC can drop both entries.
+	time.Sleep(20 * time.Millisecond)
+
+	if !l.allow("fresh@x.com") {
+		t.Fatal("after window elapses, GC should free slots and new key should be allowed")
+	}
+}
+
+// --- mandatory refresh store ---
+
+func TestNew_PanicsOnNilRefreshTokenStore(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic when IRefreshTokenStore is nil")
+		}
+	}()
+	_ = New(NewMemDb(), &MockSender{}, &MockUserCreator{}, NewEmailValidator(), nil, nil, nil, &Config{})
+}
+
 // --- shared test fixtures ---
 
-var errEnrichFail = &stringErr{"enrich exploded"}
-
-type stringErr struct{ s string }
-
-func (e *stringErr) Error() string { return e.s }
+var errEnrichFail = errors.New("enrich exploded")
 
 // Ensure the mem store handles its happy path so the integration tests above
 // have stable foundations.

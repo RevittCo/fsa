@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -41,14 +42,25 @@ type IUserIdentityVerifier interface {
 
 // IRefreshTokenStore tracks the lifecycle of refresh tokens by their jti claim.
 // Implementations must be safe for concurrent use.
+//
+// Distributed implementations (Redis, SQL, etc.) must make MarkUsed
+// linearizable across replicas — two concurrent MarkUsed calls for the same
+// jti must agree on a single winner. Reading a stale "not used" value on a
+// replica that has not yet seen a successful MarkUsed elsewhere would defeat
+// replay protection.
 type IRefreshTokenStore interface {
 	// MarkIssued records a newly minted refresh token so it can later be
-	// validated and rotated. expiresAt is the token's exp claim.
+	// validated and rotated. expiresAt is the token's exp claim. The write
+	// must be durable before the refresh token is returned to the client;
+	// otherwise a crash after issuance leaves a valid-looking token that the
+	// store has no record of and will reject as unknown.
 	MarkIssued(ctx context.Context, jti string, userID uuid.UUID, expiresAt time.Time) error
 	// MarkUsed atomically marks a refresh token's jti as used. It returns
 	// alreadyUsed=true if the jti had been used before (replay attempt).
 	// An unknown jti is treated as already-used: tokens that were never
 	// issued (or that have expired and been swept) must not be honoured.
+	// The check-and-set must be atomic — racing callers must see exactly one
+	// alreadyUsed=false response per jti.
 	MarkUsed(ctx context.Context, jti string) (alreadyUsed bool, err error)
 }
 
@@ -158,7 +170,13 @@ type Auth struct {
 	emailLimiter *emailRateLimiter
 }
 
+// New constructs an Auth. rts must not be nil — refresh-token rotation is a
+// load-bearing security property of v5 and a nil store would silently disable
+// replay protection. Use NewMemRefreshTokenStore for single-process setups.
 func New(db IAuthDb, sender ICodeSender, uc IUserCreator, ev IEmailValidator, uiv IUserIdentityVerifier, rts IRefreshTokenStore, et *template.Template, cfg *Config) *Auth {
+	if rts == nil {
+		panic("fsa.New: IRefreshTokenStore is required (use NewMemRefreshTokenStore for in-process)")
+	}
 	a := &Auth{
 		Db:                db,
 		Sender:            sender,
@@ -269,10 +287,8 @@ func (a *Auth) LoginStep2ConfirmCode(ctx context.Context, email string, code str
 		return false, nil, err
 	}
 
-	if a.RefreshTokenStore != nil {
-		if err := a.RefreshTokenStore.MarkIssued(ctx, jti, id, refreshExpiresAt); err != nil {
-			return false, nil, fmt.Errorf("record refresh token: %w", err)
-		}
+	if err := a.RefreshTokenStore.MarkIssued(ctx, jti, id, refreshExpiresAt); err != nil {
+		return false, nil, fmt.Errorf("record refresh token: %w", err)
 	}
 
 	return true, &TokenResponse{
@@ -312,18 +328,16 @@ func (a *Auth) RefreshToken(ctx context.Context, rt string) (*TokenResponse, err
 		return nil, err
 	}
 
-	if a.RefreshTokenStore != nil {
-		jti, _ := claims["jti"].(string)
-		if jti == "" {
-			return nil, fmt.Errorf("refresh token missing jti")
-		}
-		alreadyUsed, err := a.RefreshTokenStore.MarkUsed(ctx, jti)
-		if err != nil {
-			return nil, fmt.Errorf("refresh-token store: %w", err)
-		}
-		if alreadyUsed {
-			return nil, fmt.Errorf("refresh token already used")
-		}
+	jti, _ := claims["jti"].(string)
+	if jti == "" {
+		return nil, fmt.Errorf("refresh token missing jti")
+	}
+	alreadyUsed, err := a.RefreshTokenStore.MarkUsed(ctx, jti)
+	if err != nil {
+		return nil, fmt.Errorf("refresh-token store: %w", err)
+	}
+	if alreadyUsed {
+		return nil, fmt.Errorf("refresh token already used")
 	}
 
 	accessToken, err := a.mintAccessToken(ctx, idUUID, email)
@@ -336,10 +350,8 @@ func (a *Auth) RefreshToken(ctx context.Context, rt string) (*TokenResponse, err
 		return nil, err
 	}
 
-	if a.RefreshTokenStore != nil {
-		if err := a.RefreshTokenStore.MarkIssued(ctx, newJti, idUUID, refreshExpiresAt); err != nil {
-			return nil, fmt.Errorf("record refresh token: %w", err)
-		}
+	if err := a.RefreshTokenStore.MarkIssued(ctx, newJti, idUUID, refreshExpiresAt); err != nil {
+		return nil, fmt.Errorf("record refresh token: %w", err)
 	}
 
 	return &TokenResponse{
@@ -458,10 +470,20 @@ func (a *Auth) ParseTemplate(link, code string) string {
 	return body.String()
 }
 
-// resolvedPrefix returns the configured auth route prefix, defaulting to /auth.
+// resolvedPrefix returns the configured auth route prefix, defaulting to
+// /auth. The configured value is normalized so callers can pass "auth",
+// "/auth/", or "auth/" interchangeably; an effectively empty prefix
+// (e.g. "/" or "") falls back to the default.
 func (c *Config) resolvedPrefix() string {
-	if c == nil || c.Prefix == "" {
+	if c == nil {
 		return "/auth"
 	}
-	return c.Prefix
+	p := strings.TrimRight(c.Prefix, "/")
+	if p == "" {
+		return "/auth"
+	}
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	return p
 }
