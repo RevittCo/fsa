@@ -73,7 +73,7 @@ func TestLoginStep1_URLEncodesSpecialCharacters(t *testing.T) {
 
 func TestLoginStep1_DefaultsEmptyReturnUrl(t *testing.T) {
 	mockSender := &MockSender{}
-	auth := New(NewMemDb(), mockSender, &MockUserCreator{}, NewEmailValidator(), nil, nil, &Config{
+	auth := New(NewMemDb(), mockSender, &MockUserCreator{}, NewEmailValidator(), nil, NewMemRefreshTokenStore(), nil, &Config{
 		AppName:                    "TestApp",
 		ReturnUrls:                 []string{"https://default.com/login"},
 		AccessTokenSecret:          "secret",
@@ -95,7 +95,7 @@ func TestLoginStep1_DefaultsEmptyReturnUrl(t *testing.T) {
 
 func TestLoginStep1_RejectsInvalidReturnUrl(t *testing.T) {
 	mockSender := &MockSender{}
-	auth := New(NewMemDb(), mockSender, &MockUserCreator{}, NewEmailValidator(), nil, nil, &Config{
+	auth := New(NewMemDb(), mockSender, &MockUserCreator{}, NewEmailValidator(), nil, NewMemRefreshTokenStore(), nil, &Config{
 		AppName:                    "TestApp",
 		ReturnUrls:                 []string{"https://allowed.com/login"},
 		AccessTokenSecret:          "secret",
@@ -120,7 +120,7 @@ func TestLoginStep1_RejectsInvalidReturnUrl(t *testing.T) {
 
 func TestLoginStep1_ErrorsWhenNoReturnUrlsConfigured(t *testing.T) {
 	mockSender := &MockSender{}
-	auth := New(NewMemDb(), mockSender, &MockUserCreator{}, NewEmailValidator(), nil, nil, &Config{
+	auth := New(NewMemDb(), mockSender, &MockUserCreator{}, NewEmailValidator(), nil, NewMemRefreshTokenStore(), nil, &Config{
 		AppName:                    "TestApp",
 		ReturnUrls:                 []string{},
 		AccessTokenSecret:          "secret",
@@ -184,7 +184,7 @@ func TestRefreshToken_RejectsExpiredJWT(t *testing.T) {
 	auth := createTestAuth()
 
 	// Create an expired refresh token
-	expiredToken, err := createRefreshToken(
+	expiredToken, _, _, err := createRefreshToken(
 		uuid.New(),
 		"test@example.com",
 		auth.Cfg.RefreshTokenSecret,
@@ -212,14 +212,18 @@ func TestRefreshToken_RejectsInvalidJWT(t *testing.T) {
 func TestRefreshToken_ReturnsNewTokenPair(t *testing.T) {
 	auth := createTestAuth()
 
-	refreshToken, err := createRefreshToken(
-		uuid.New(),
+	userID := uuid.New()
+	refreshToken, jti, expiresAt, err := createRefreshToken(
+		userID,
 		"test@example.com",
 		auth.Cfg.RefreshTokenSecret,
 		auth.Cfg.RefreshTokenValidityPeriod,
 	)
 	if err != nil {
 		t.Fatalf("failed to create token: %v", err)
+	}
+	if err := auth.RefreshTokenStore.MarkIssued(context.Background(), jti, userID, expiresAt); err != nil {
+		t.Fatalf("failed to record token: %v", err)
 	}
 
 	tokens, err := auth.RefreshToken(context.Background(), refreshToken.Token)
@@ -239,7 +243,7 @@ func TestRefreshToken_ReturnsNewTokenPair(t *testing.T) {
 
 func TestLoginStep1_AcceptsValidReturnUrl(t *testing.T) {
 	mockSender := &MockSender{}
-	auth := New(NewMemDb(), mockSender, &MockUserCreator{}, NewEmailValidator(), nil, nil, &Config{
+	auth := New(NewMemDb(), mockSender, &MockUserCreator{}, NewEmailValidator(), nil, NewMemRefreshTokenStore(), nil, &Config{
 		AppName:                    "TestApp",
 		ReturnUrls:                 []string{"https://app1.com/login", "https://app2.com/login"},
 		AccessTokenSecret:          "secret",

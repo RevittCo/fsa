@@ -1,6 +1,7 @@
 package fsa
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -189,7 +190,7 @@ func TestConfirmCode_RejectsGET(t *testing.T) {
 func TestRefreshToken_RejectsExpiredToken(t *testing.T) {
 	router, auth := createTestHandlerWithRouter()
 
-	expiredToken, err := createRefreshToken(
+	expiredToken, _, _, err := createRefreshToken(
 		mustParseUUID("550e8400-e29b-41d4-a716-446655440000"),
 		"test@example.com",
 		auth.Cfg.RefreshTokenSecret,
@@ -213,14 +214,18 @@ func TestRefreshToken_RejectsExpiredToken(t *testing.T) {
 func TestRefreshToken_POSTMethod(t *testing.T) {
 	router, auth := createTestHandlerWithRouter()
 
-	refreshToken, err := createRefreshToken(
-		mustParseUUID("550e8400-e29b-41d4-a716-446655440000"),
+	userID := mustParseUUID("550e8400-e29b-41d4-a716-446655440000")
+	refreshToken, jti, expiresAt, err := createRefreshToken(
+		userID,
 		"test@example.com",
 		auth.Cfg.RefreshTokenSecret,
 		auth.Cfg.RefreshTokenValidityPeriod,
 	)
 	if err != nil {
 		t.Fatalf("failed to create refresh token: %v", err)
+	}
+	if err := auth.RefreshTokenStore.MarkIssued(context.Background(), jti, userID, expiresAt); err != nil {
+		t.Fatalf("failed to record token: %v", err)
 	}
 
 	req := httptest.NewRequest("POST", "/auth/refresh", nil)

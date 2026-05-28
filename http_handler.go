@@ -23,19 +23,33 @@ func NewHandler(r chi.Router, auth *Auth) *Handler {
 }
 
 func (h *Handler) SetupRoutes(router chi.Router) {
-	fmt.Println("setting up routes for auth")
+	prefix := h.auth.Cfg.resolvedPrefix()
 
 	limiter := tollbooth.NewLimiter(float64(h.auth.Cfg.RateLimitPerSecond), nil)
 	limiter.SetIPLookups([]string{"RemoteAddr", "X-Forwarded-For", "X-Real-IP"})
 
 	router.Group(func(r chi.Router) {
+		if h.auth.Cfg.CORSConfig != nil {
+			r.Use(NewCORSMiddleware(h.auth.Cfg.CORSConfig))
+		}
 		if h.auth.Cfg.RateLimitPerSecond > 0 {
 			r.Use(tollbooth_chi.LimitHandler(limiter))
 		}
-		r.Post("/auth/login", h.Login)
-		r.Post("/auth/confirm", h.ConfirmCode)
-		r.Post("/auth/refresh", h.RefreshToken)
-		r.Post("/auth/logout", h.Logout)
+		r.Post(prefix+"/login", h.Login)
+		r.Post(prefix+"/confirm", h.ConfirmCode)
+		r.Post(prefix+"/refresh", h.RefreshToken)
+		r.Post(prefix+"/logout", h.Logout)
+
+		// Register OPTIONS handlers so the CORS middleware can short-circuit
+		// preflight requests — without these, chi returns 405 before the
+		// middleware fires. The handler body is unreachable in practice.
+		if h.auth.Cfg.CORSConfig != nil {
+			noop := func(w http.ResponseWriter, r *http.Request) {}
+			r.Options(prefix+"/login", noop)
+			r.Options(prefix+"/confirm", noop)
+			r.Options(prefix+"/refresh", noop)
+			r.Options(prefix+"/logout", noop)
+		}
 	})
 }
 
@@ -53,6 +67,11 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 
 	if len(req.Email) == 0 {
 		WriteErr(w, fmt.Errorf("email required"), http.StatusBadRequest)
+		return
+	}
+
+	if h.auth.emailLimiter != nil && !h.auth.emailLimiter.allow(req.Email) {
+		WriteErr(w, fmt.Errorf("rate limit exceeded for this email"), http.StatusTooManyRequests)
 		return
 	}
 
@@ -100,6 +119,11 @@ func (h *Handler) ConfirmCode(w http.ResponseWriter, r *http.Request) {
 
 	if len(req.Code) == 0 || len(req.Email) == 0 {
 		WriteErr(w, fmt.Errorf("code and email required"), http.StatusBadRequest)
+		return
+	}
+
+	if h.auth.emailLimiter != nil && !h.auth.emailLimiter.allow(req.Email) {
+		WriteErr(w, fmt.Errorf("rate limit exceeded for this email"), http.StatusTooManyRequests)
 		return
 	}
 
