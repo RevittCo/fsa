@@ -41,7 +41,7 @@ func (s *loginLinkSender) Send(to, _ string, body string) error {
 }
 
 func newLoginLinkAuth(db *loginLinkDB, sender *loginLinkSender, tpl *template.Template, returnURL string) *Auth {
-	return New(db, sender, nil, NewEmailValidator(), nil, nil, tpl, &Config{
+	return New(db, sender, nil, NewEmailValidator(), nil, NewMemRefreshTokenStore(), tpl, &Config{
 		AppName: "FSA Test", ReturnUrls: []string{returnURL}, CodeValidityPeriod: time.Minute,
 	})
 }
