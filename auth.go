@@ -3,6 +3,7 @@ package fsa
 import (
 	"fmt"
 	"math/rand"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -129,17 +130,27 @@ func (a *Auth) LoginStep1SendVerificationCode(ctx context.Context, email, return
 		}
 	}
 
+	loginURL, err := url.Parse(returnUrl)
+	if err != nil {
+		return fmt.Errorf("invalid return url: %w", err)
+	}
+	query, err := url.ParseQuery(loginURL.RawQuery)
+	if err != nil {
+		return fmt.Errorf("invalid return url query: %w", err)
+	}
+
 	code := generateCode()
 	expiresAt := time.Now().Add(a.Cfg.CodeValidityPeriod)
 
-	err := a.Db.StoreVerificationCode(email, code, expiresAt)
+	err = a.Db.StoreVerificationCode(email, code, expiresAt)
 	if err != nil {
 		return err
 	}
 
-	// send the code
-	link := fmt.Sprintf("%s?code=%s&email=%s", returnUrl, code, email)
-	body := a.ParseTemplate(link, code)
+	query.Set("code", code)
+	query.Set("email", email)
+	loginURL.RawQuery = query.Encode()
+	body := a.ParseTemplate(loginURL.String(), code)
 	err = a.Sender.Send(email, "Login Verification Code", body)
 	if err != nil {
 		removalErr := a.Db.RemoveVerificationCode(email)

@@ -2,9 +2,9 @@ name: Go Build and Test
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, maintenance/v2 ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, maintenance/v2 ]
   workflow_dispatch:
 
 concurrency:
